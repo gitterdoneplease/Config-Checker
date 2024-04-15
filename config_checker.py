@@ -25,6 +25,7 @@ def read_config_file(file_name):
 def run_ansible_tasks(inventory, hosts, files, check_kernel):
     init()  # Initialize colorama for colored output
     results = {}
+    forks = 10  # Example value, adjust based on your environment and needs
 
     for entry in files:
         if entry.endswith('*'):
@@ -37,7 +38,8 @@ def run_ansible_tasks(inventory, hosts, files, check_kernel):
                 module='shell',
                 module_args=command,
                 host_pattern=hosts,
-                quiet=True
+                quiet=True,
+                forks=forks
             )
             process_directory_result(result, results)
         else:
@@ -49,13 +51,14 @@ def run_ansible_tasks(inventory, hosts, files, check_kernel):
                 module='shell',
                 module_args=command,
                 host_pattern=hosts,
-                quiet=True
+                quiet=True,
+                forks=forks
             )
             process_file_result(result, entry, results)
 
     if check_kernel:
         print("Checking kernel versions...")
-        kernel_versions = get_kernel_versions(inventory, hosts)
+        kernel_versions = get_kernel_versions(inventory, hosts, forks)
         results['Kernel Version'] = kernel_versions
 
     return results
@@ -87,7 +90,7 @@ def process_file_result(result, entry, results):
                     checksum, _ = stdout.split(maxsplit=1)
                     results[entry][checksum] = results[entry].get(checksum, []) + [host]
 
-def get_kernel_versions(inventory, hosts):
+def get_kernel_versions(inventory, hosts, forks):
     command = 'uname -r'
     result = ansible_runner.run(
         private_data_dir='.',
@@ -95,7 +98,8 @@ def get_kernel_versions(inventory, hosts):
         module='shell',
         module_args=command,
         host_pattern=hosts,
-        quiet=True
+        quiet=True,
+        forks=forks
     )
     kernels = {}
     if result.status == 'successful':
