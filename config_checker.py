@@ -1,7 +1,7 @@
 import argparse
 import ansible_runner
-import re
 from colorama import Fore, Style, init
+import re
 
 def parse_arguments():
     parser = argparse.ArgumentParser(
@@ -29,125 +29,129 @@ def run_ansible_tasks(inventory, hosts, files, check_kernel):
     for entry in files:
         if entry.endswith('*'):
             directory = entry[:-1]  # Remove the asterisk
-            all_files = get_all_files_in_directory(directory, inventory, hosts)
-            for file in all_files:
-                print(f"Checking {file}...")
-                results[file] = get_checksums_for_file(file, inventory, hosts)
+            command = f"find {directory} -type f -exec md5sum {{}} \;"
+            print(f"Checking all files in directory: {directory}...")
+            result = ansible_runner.run(
+                private_data_dir='.',
+                inventory=inventory,
+                module='shell',
+                module_args=command,
+                host_pattern=hosts,
+                quiet=True
+            )
+            process_directory_result(result, results)
         else:
+            command = f"md5sum {entry} || echo '{entry} does not exist'"
             print(f"Checking {entry}...")
-            results[entry] = get_checksums_for_file(entry, inventory, hosts)
+            result = ansible_runner.run(
+                private_data_dir='.',
+                inventory=inventory,
+                module='shell',
+                module_args=command,
+                host_pattern=hosts,
+                quiet=True
+            )
+            process_file_result(result, entry, results)
 
     if check_kernel:
         print("Checking kernel versions...")
-        results['Kernel Version'] = get_kernel_versions(inventory, hosts)
+        kernel_versions = get_kernel_versions(inventory, hosts)
+        results['Kernel Version'] = kernel_versions
 
-    print("\n" + "-"*50 + "\n")  # Separator between checking and results output
     return results
 
-def get_all_files_in_directory(directory, inventory, hosts):
-    unique_files = set()
-    list_files_result = ansible_runner.run(
-        private_data_dir='.',
-        inventory=inventory,
-        module='shell',
-        module_args=f'ls {directory}',
-        host_pattern=hosts,
-        quiet=True
-    )
-    if list_files_result.status == 'successful':
-        for event in list_files_result.events:
-            if event['event'] == 'runner_on_ok':
-                files = event['event_data']['res']['stdout'].split()
-                unique_files.update([f"{directory}/{file}" for file in files])
-    return unique_files
-
-def get_checksums_for_file(file_path, inventory, hosts):
-    checksum_result = ansible_runner.run(
-        private_data_dir='.',
-        inventory=inventory,
-        module='shell',
-        module_args=f'if [ -f {file_path} ]; then md5sum {file_path}; else echo "File does not exist"; fi',
-        host_pattern=hosts,
-        quiet=True
-    )
-    checksums = {}
-    if checksum_result.status == 'successful':
-        for event in checksum_result.events:
-            if event['event'] == 'runner_on_ok':
+def process_directory_result(result, results):
+    if result.status == 'successful':
+        for event in result.events:
+            if 'runner_on_ok' in event['event']:
                 host = event['event_data']['host']
-                output = event['event_data']['res']['stdout']
-                if output == "File does not exist":
-                    checksums[host] = "File does not exist"
+                stdout_lines = event['event_data']['res']['stdout_lines']
+                for line in stdout_lines:
+                    checksum, file_path = line.split(maxsplit=1)
+                    if file_path not in results:
+                        results[file_path] = {}
+                    if checksum not in results[file_path]:
+                        results[file_path][checksum] = []
+                    results[file_path][checksum].append(host)
+
+def process_file_result(result, entry, results):
+    results[entry] = {}
+    if result.status == 'successful':
+        for event in result.events:
+            if 'runner_on_ok' in event['event']:
+                host = event['event_data']['host']
+                stdout = event['event_data']['res']['stdout']
+                if "does not exist" in stdout:
+                    results[entry]["File does not exist"] = results[entry].get("File does not exist", []) + [host]
                 else:
-                    md5sum = output.split()[0]
-                    checksums[host] = md5sum
-    return checksums
+                    checksum, _ = stdout.split(maxsplit=1)
+                    results[entry][checksum] = results[entry].get(checksum, []) + [host]
 
 def get_kernel_versions(inventory, hosts):
-    kernel_result = ansible_runner.run(
+    command = 'uname -r'
+    result = ansible_runner.run(
         private_data_dir='.',
         inventory=inventory,
         module='shell',
-        module_args='uname -r',
+        module_args=command,
         host_pattern=hosts,
         quiet=True
     )
     kernels = {}
-    if kernel_result.status == 'successful':
-        for event in kernel_result.events:
-            if event['event'] == 'runner_on_ok':
+    if result.status == 'successful':
+        for event in result.events:
+            if 'runner_on_ok' in event['event']:
                 host = event['event_data']['host']
-                kernel_version = event['event_data']['res']['stdout']
+                kernel_version = event['event_data']['res']['stdout'].strip()
                 kernels[host] = kernel_version
     return kernels
 
-def compare_checksums(results):
-    for item, values in results.items():
-        # Collect all unique checksums and the hosts associated with each checksum
-        checksums = {}
-        for host, checksum in values.items():
-            if checksum not in checksums:
-                checksums[checksum] = []
-            checksums[checksum].append(host)
-        
-        # Sort hosts within each checksum group
-        for checksum in checksums:
-            checksums[checksum] = sorted(checksums[checksum], key=lambda x: int(re.search(r'\d+', x).group()))
+def display_kernel_versions(data):
+    kernel_versions = set(data.values())
+    if len(kernel_versions) == 1:
+        version = next(iter(kernel_versions))
+        print(Fore.GREEN + f"Kernel Version is the same across all hosts: {version}" + Style.RESET_ALL)
+    else:
+        print(Fore.RED + "Kernel Version differs across hosts:" + Style.RESET_ALL)
+        sorted_versions = sorted(data.items(), key=lambda item: natural_sort_key(item[0]))
+        for host, version in sorted_versions:
+            print(f"  {host}: {version}")
 
-        if len(checksums) == 1 and next(iter(checksums.values()))[0] != "File does not exist":  # All the same checksum
-            print(Fore.GREEN + f"{item} is the same across all hosts with checksum: {next(iter(checksums))}" + Style.RESET_ALL)
+def display_results(results):
+    print("\n" + "-"*50 + "\n")
+    for file_path, data in results.items():
+        if file_path == 'Kernel Version':
+            display_kernel_versions(data)
+        elif isinstance(data, dict):
+            display_file_checksums(file_path, data)
         else:
-            print(Fore.RED + f"{item} differs across hosts:" + Style.RESET_ALL)
-            if "File does not exist" in checksums:
+            print(f"{file_path} has unexpected data format in results.")
+    print()
+
+def display_file_checksums(file_path, data):
+    if "File does not exist" in data and len(data) == 1:
+        print(Fore.YELLOW + f"{file_path} is missing from all hosts:" + Style.RESET_ALL)
+        for host in sorted(data["File does not exist"], key=natural_sort_key):
+            print(f"  {host}")
+    elif len(data) == 1:
+        checksum = next(iter(data))
+        print(Fore.GREEN + f"{file_path} is the same across all hosts with checksum: {checksum}" + Style.RESET_ALL)
+    else:
+        print(f"{file_path} differs across hosts:")
+        for checksum, hosts in sorted(data.items(), key=lambda x: x[0]):
+            if checksum == "File does not exist":
                 print(Fore.YELLOW + "Missing from the following hosts:" + Style.RESET_ALL)
-                for host in checksums["File does not exist"]:
-                    print(f"  {host}")
-                del checksums["File does not exist"]  # Remove the missing file entry for further processing
+            else:
+                print(Fore.RED + f"  Checksum: {checksum}" + Style.RESET_ALL)
+            for host in sorted(hosts, key=natural_sort_key):
+                print(f"    Host: {host}")
 
-            # Sort checksums by the first host number in each group
-            for checksum, hosts in sorted(checksums.items(), key=lambda x: int(re.search(r'\d+', x[1][0]).group())):
-                print(f"  Checksum: {checksum}")
-                for host in hosts:
-                    print(f"    Host: {host}")
-
-def print_checksum_groups(item, values):
-    # Sorting values by checksum and then each host group
-    sorted_values = {}
-    for host, value in values.items():
-        if value not in sorted_values:
-            sorted_values[value] = []
-        sorted_values[value].append(host)
-    
-    # Sorting checksums to ensure consistent order
-    for value, hosts in sorted(sorted_values.items(), key=lambda x: x[0]):
-        print(Fore.RED + f"{item} differs across hosts:" + Style.RESET_ALL)
-        print(f"  Checksum: {value}")
-        sorted_hosts = sorted(hosts, key=lambda x: int(re.search(r'\d+', x).group()))
-        for host in sorted_hosts:
-            print(f"    Host: {host}")
+def natural_sort_key(s):
+    """Helper function to sort strings with numeric components in natural order."""
+    return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
 
 if __name__ == "__main__":
     args = parse_arguments()
     files_to_check = read_config_file(args.config_file) if not args.check_kernel else []
     results = run_ansible_tasks(args.inventory, args.hosts, files_to_check, args.check_kernel)
-    compare_checksums(results)
+    display_results(results)
